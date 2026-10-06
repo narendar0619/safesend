@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SafeSend Cloud</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="config.js"></script>
+  <style>
+    :root { font-family: system-ui, sans-serif; color-scheme: dark; }
+    body { margin: 0; background: #10141d; color: #edf2f7; }
+    main { max-width: 720px; margin: 40px auto; padding: 0 20px; }
+    .card { margin: 18px 0; padding: 24px; border: 1px solid #304057; border-radius: 14px; background: #192231; }
+    input, button { box-sizing: border-box; width: 100%; border-radius: 8px; font: inherit; }
+    input { margin: 7px 0 16px; padding: 11px; border: 1px solid #536681; background: #101722; color: inherit; }
+    button { padding: 11px 16px; border: 0; background: #5b8cff; color: white; font-weight: 700; cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    label { display: block; font-weight: 600; }
+    p, small { color: #aebbd0; }
+    .status { min-height: 24px; color: #9fd8af; }
+    .error { color: #ff9eae; }
+    .code { margin: 22px 0; color: #9fd8af; font-size: 2.4rem; letter-spacing: .18em; text-align: center; }
+    progress { width: 100%; margin: 10px 0; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>SafeSend Cloud</h1>
+  <p>Files are encrypted in your browser before they are uploaded. Supabase stores ciphertext only.</p>
+
+  <section class="card">
+    <h2>Send a file</h2>
+    <label for="file">File or picture</label>
+    <input id="file" type="file">
+    <label for="sendPassword">Encryption password</label>
+    <input id="sendPassword" type="password" autocomplete="new-password" placeholder="Share separately">
+    <button id="send">Encrypt and upload</button>
+    <progress id="sendProgress" max="100" value="0" hidden></progress>
+    <p id="sendStatus" class="status"></p>
+    <div id="code" class="code" hidden></div>
+  </section>
+
+  <section class="card">
+    <h2>Receive a file</h2>
+    <label for="receiveCode">Share code</label>
+    <input id="receiveCode" maxlength="8" placeholder="Example: ZP6SCUBH">
+    <label for="receivePassword">Encryption password</label>
+    <input id="receivePassword" type="password" autocomplete="off">
+    <button id="receive">Download and decrypt</button>
+    <progress id="receiveProgress" max="100" value="0" hidden></progress>
+    <p id="receiveStatus" class="status"></p>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const MAX_BYTES = 100 * 1024 * 1024;
+const CHUNK_BYTES = 1024 * 1024;
+const BUCKET = "shares";
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const supabaseClient = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
+const $ = (id) => document.getElementById(id);
+
+function setStatus(id, text, error = false) {
+  $(id).textContent = text;
+  $(id).className = error ? "status error" : "status";
+}
+
+function encodeBase64(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function decodeBase64(value) {
+  return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+}
+
+function makeCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
+}
+
+async function deriveKey(password, salt) {
+  const material = await crypto.subtle.importKey(
+    "raw", encoder.encode(password), "PBKDF2", false, ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: 250000, hash: "SHA-256" },
+    material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptFile(file, password, progress) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await deriveKey(password, salt);
+  const chunks = [];
+  const sizes = [];
+  const total = Math.ceil(file.size / CHUNK_BYTES);
+
+  for (let index = 0; index < total; index += 1) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const plaintext = await file.slice(index * CHUNK_BYTES, (index + 1) * CHUNK_BYTES).arrayBuffer();
+    const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext));
+    chunks.push(iv, ciphertext);
+    sizes.push(ciphertext.length);
+    progress.value = ((index + 1) / total) * 100;
+  }
+
+  const metadata = encoder.encode(JSON.stringify({
+    name: file.name, type: file.type || "application/octet-stream", sizes, salt: encodeBase64(salt)
+  }));
+  const length = new Uint8Array(4);
+  new DataView(length.buffer).setUint32(0, metadata.length);
+  return { blob: new Blob([length, metadata, ...chunks]), salt };
+}
+
+async function decryptFile(blob, password, progress) {
+  const raw = new Uint8Array(await blob.arrayBuffer());
+  const metadataLength = new DataView(raw.buffer).getUint32(0);
+  const metadata = JSON.parse(decoder.decode(raw.slice(4, 4 + metadataLength)));
+  const key = await deriveKey(password, decodeBase64(metadata.salt));
+  const parts = [];
+  let offset = 4 + metadataLength;
+
+  for (let index = 0; index < metadata.sizes.length; index += 1) {
+    const iv = raw.slice(offset, offset + 12);
+    offset += 12;
+    const ciphertext = raw.slice(offset, offset + metadata.sizes[index]);
+    offset += metadata.sizes[index];
+    parts.push(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext));
+    progress.value = ((index + 1) / metadata.sizes.length) * 100;
+  }
+  return { blob: new Blob(parts, { type: metadata.type }), name: metadata.name };
+}
+
+$("send").onclick = async () => {
+  const file = $("file").files[0];
+  const password = $("sendPassword").value;
+  if (!file) return setStatus("sendStatus", "Choose a file first.", true);
+  if (file.size > MAX_BYTES) return setStatus("sendStatus", "Maximum file size is 100 MB.", true);
+  if (password.length < 8) return setStatus("sendStatus", "Use at least 8 password characters.", true);
+
+  try {
+    $("send").disabled = true;
+    $("sendProgress").hidden = false;
+    const encrypted = await encryptFile(file, password, $("sendProgress"));
+    const code = makeCode();
+    const path = `${code}.bin`;
+    const upload = await supabaseClient.storage.from(BUCKET).upload(path, encrypted.blob, {
+      contentType: "application/octet-stream", upsert: false
+    });
+    if (upload.error) throw upload.error;
+    $("code").textContent = code;
+    $("code").hidden = false;
+    setStatus("sendStatus", "Upload complete. Share the code and password separately.");
+  } catch (error) {
+    setStatus("sendStatus", error.message || "Upload failed.", true);
+  } finally {
+    $("send").disabled = false;
+    $("sendProgress").hidden = true;
+  }
+};
+
+$("receive").onclick = async () => {
+  const code = $("receiveCode").value.trim().toUpperCase();
+  const password = $("receivePassword").value;
+  if (!/^[A-Z0-9]{8}$/.test(code)) return setStatus("receiveStatus", "Enter an 8-character code.", true);
+  if (password.length < 8) return setStatus("receiveStatus", "Enter the sender's password.", true);
+
+  try {
+    $("receive").disabled = true;
+    $("receiveProgress").hidden = false;
+    const result = await supabaseClient.storage.from(BUCKET).download(`${code}.bin`);
+    if (result.error) throw result.error;
+    const decrypted = await decryptFile(result.data, password, $("receiveProgress"));
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(decrypted.blob);
+    link.download = decrypted.name;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    setStatus("receiveStatus", `Downloaded and decrypted ${decrypted.name}.`);
+  } catch (error) {
+    setStatus("receiveStatus", "Download failed. Check the code and password.", true);
+  } finally {
+    $("receive").disabled = false;
+    $("receiveProgress").hidden = true;
+  }
+};
+</script>
+</body>
+</html>
